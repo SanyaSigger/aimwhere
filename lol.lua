@@ -69,6 +69,9 @@ getgenv().wh_fov_toggle     = true;  -- draw the FOV circle
 getgenv().wh_fov_center     = true;  -- circle stays on screen centre (not the cursor)
 getgenv().wh_fov_color      = Color3.fromRGB(150, 0, 255);
 getgenv().wh_tracers        = true;
+getgenv().wh_tracer_bullets = true;  -- real per-pellet trajectories
+getgenv().wh_tracer_life    = 0.35;  -- seconds a trail stays on screen
+getgenv().wh_tracer_seg_color = Color3.fromRGB(255, 230, 120);
 getgenv().wh_tracer_color   = Color3.fromRGB(150, 0, 255);
 getgenv().wh_aim_part       = "Head";
 getgenv().wh_wallcheck      = false; -- only shoot parts a raycast can actually reach
@@ -80,6 +83,8 @@ getgenv().wh_prediction     = true;
 getgenv().wh_lead           = 1;     -- 1 = exact lead, >1 over-leads, <1 under-leads
 getgenv().wh_ragebot        = false; -- ignore the FOV circle: lock anyone on screen
 getgenv().wh_autoshoot      = false; -- fire on the locked target without holding LMB
+getgenv().wh_fire_input     = "VIM"; -- VIM | Executor | Env
+getgenv().wh_autoshoot_pulse = 0.08;  -- press/release period for semi/pump guns
 getgenv().wh_no_spread      = true;
 getgenv().wh_no_recoil      = true;
 getgenv().wh_auto_fix       = false; -- clear a stuck weapon automatically (opt-in)
@@ -97,6 +102,9 @@ getgenv().wh_esp_box_color  = Color3.fromRGB(150, 0, 255);
 getgenv().wh_esp_name_color = Color3.fromRGB(235, 235, 240);
 getgenv().wh_esp_hp_color   = Color3.fromRGB(80, 220, 120);
 getgenv().wh_esp_horses     = true;
+getgenv().wh_item_finder    = false; -- show what a player is holding
+getgenv().wh_item_search    = { Any = true }; -- Linoria Multi values are a set
+getgenv().wh_item_color      = Color3.fromRGB(120, 255, 140);
 
 -- Weapon extras
 getgenv().wh_no_bullet_drop = true;
@@ -107,6 +115,12 @@ getgenv().wh_full_auto     = false; -- Semi/Pump guns fire while the button is h
 
 -- Movement
 getgenv().wh_speed_on       = false;
+getgenv().wh_speed_method   = "CFrame"; -- CFrame | TPWalk
+getgenv().wh_tp_interval   = 0.1;   -- TPWalk: seconds between hops
+getgenv().wh_tp_distance   = 2;     -- TPWalk: studs per hop
+getgenv().wh_tp_smooth     = true;  -- spread each hop over the interval instead of teleporting
+getgenv().wh_jump          = false;
+getgenv().wh_jump_power    = 95;    -- studs/s of upward velocity on take-off
 getgenv().wh_speed          = 45;    -- extra studs/s appended by CFrame movement
 getgenv().wh_shoot_riding   = false; -- keep a gun equipped while seated on a horse
 
@@ -118,13 +132,14 @@ getgenv().wh_fake_pitch     = 0;
 getgenv().wh_fake_yaw       = 180;   -- 180 = body faces backwards
 getgenv().wh_fake_roll      = 0;
 getgenv().wh_fake_target_based = false; -- face the silent-aim target instead of the camera
-getgenv().wh_fake_mode      = "Custom"; -- Custom | Spin | Random
+getgenv().wh_fake_mode      = "Custom"; -- Custom | Spin | Random | Jitter
 
 -- Fall damage
 getgenv().wh_no_fall        = true;
 getgenv().wh_fall_speed     = 60;   -- max downward studs/s while falling
 getgenv().wh_fake_spin_speed = 360;    -- deg/s while in Spin
 getgenv().wh_fake_rand_int   = 0.4;    -- seconds between random changes
+getgenv().wh_jitter_interval  = 0.15;  -- seconds between yaw changes in Jitter
 
 -- Fly (CFrame)
 getgenv().wh_fly            = false;
@@ -522,29 +537,73 @@ local itemConfigs; -- the name -> builder map (required once)
 local wrapped = {}; -- [builder] = true
 -- the game builds a gun's stats ONCE PER EQUIP, so the built table is kept keyed
 -- by tool in liveConfigs - it is the only place the real ProjectileVelocity is readable
-local function patchStats(t, tool)
-    if type(tool) == "Instance" then liveConfigs[tool] = t; end;
-    if type(t) ~= "table" then return t; end;
+-- Every weapon config builder in this game ends with `return table.freeze(t)`,
+-- so writing to the table we are handed is REJECTED - which is exactly why the
+-- weapon mods used to do nothing at all (the write error was swallowed). Detect
+-- the frozen table once and hand the game a private writable copy instead: it is
+-- the same data, and the fire code only reads fields off whatever GunConfig it
+-- is given.
+local frozenCache = setmetatable({}, { __mode = "k" });
+local baseRPM = setmetatable({}, { __mode = "k" });
+
+local function writableVersion(cfg)
+    local cached = frozenCache[cfg];
+    if cached then return cached; end;
+    -- try an in-place no-op write of an existing key: allowed on a normal table,
+    -- an error on a frozen one
+    local probe = cfg.ProjectileSpread ~= nil and "ProjectileSpread"
+        or (cfg.RPM ~= nil and "RPM" or nil);
+    if probe then
+        local ok = pcall(function() cfg[probe] = cfg[probe]; end);
+        if ok then return cfg; end; -- writable: edit in place
+    end;
+    local copy = table.clone(cfg);
+    if type(copy.RecoilInfo) == "table" then copy.RecoilInfo = table.clone(copy.RecoilInfo); end;
+    frozenCache[cfg] = copy;
+    return copy;
+end
+
+local function applyWeaponModsTo(cfg)
+    if type(cfg) ~= "table" then return cfg, false; end;
+    local t = writableVersion(cfg);
+    local touched = false;
     if getgenv().wh_no_spread and type(t.ProjectileSpread) == "number" then
         pcall(function() t.ProjectileSpread = 0; end);
+        touched = true;
     end;
     if getgenv().wh_no_bullet_drop and type(t.ProjectileGravity) == "number" then
         pcall(function() t.ProjectileGravity = 0; end);
+        touched = true;
     end;
     if getgenv().wh_instant_hit and type(t.ProjectileVelocity) == "number" then
         pcall(function() t.ProjectileVelocity = 0; end);
+        touched = true;
     end;
     if getgenv().wh_no_recoil and type(t.RecoilInfo) == "table" then
         pcall(function() t.RecoilInfo.NudgeX = NumberRange.new(0, 0); end);
         pcall(function() t.RecoilInfo.NudgeY = NumberRange.new(0, 0); end);
+        touched = true;
     end;
-    -- BOTH firemode envs derive their interval from 60 / GunConfig.RPM, so
-    -- scaling RPM here is what actually makes the gun fire faster
-    if getgenv().wh_rapidfire and type(t.RPM) == "number" and t.RPM > 0 then
-        local mult = math.max(getgenv().wh_rpm_mult or 1, 0.1);
-        pcall(function() t.RPM = t.RPM * mult; end);
+    -- BOTH fire mode envs derive the shot interval from 60 / RPM. The original
+    -- RPM is remembered per table so re-applying multiplies the BASE value
+    -- instead of compounding on the current one.
+    if type(t.RPM) == "number" and t.RPM > 0 then
+        if baseRPM[t] == nil then baseRPM[t] = t.RPM; end;
+        if getgenv().wh_rapidfire then
+            local mult = math.max(getgenv().wh_rpm_mult or 1, 0.1);
+            pcall(function() t.RPM = baseRPM[t] * mult; end);
+            touched = true;
+        else
+            pcall(function() t.RPM = baseRPM[t]; end);
+        end;
     end;
-    return t;
+    return t, touched;
+end
+
+local function patchStats(t, tool)
+    local patched = applyWeaponModsTo(t);
+    if type(tool) == "Instance" then liveConfigs[tool] = patched; end;
+    return patched;
 end
 
 local function wrapBuilder(fn)
@@ -577,8 +636,8 @@ end
 local function installWeaponHooks()
     if itemConfigs == nil then
         -- GameConfiguration.ItemConfigs is the exact table the gun reads
-        -- (GameConfiguration.ItemConfigs[attr](tool)), so prefer it over
-        -- hunting for a module by name and hoping it is the same instance.
+        -- (GameConfiguration.ItemConfigs[attr](tool)), so prefer it over hunting
+        -- for a module by name and hoping it is the same instance.
         pcall(function()
             local gc = require(findModuleByName("GameConfiguration"));
             if type(gc) == "table" and type(gc.ItemConfigs) == "table" then
@@ -724,6 +783,9 @@ local envWrapped = {}; -- [factory] = true
 -- so it uses the real shot path: ammo, reload and the CommunicateGun2 remote
 -- all behave exactly as if you had clicked.
 local envByTool = setmetatable({}, { __mode = "k" });
+local envRealStart = setmetatable({}, { __mode = "k" }); -- original FireInputStart
+local envRealExtra = setmetatable({}, { __mode = "k" }); -- original CanFire/ShootOnce
+local applyEnvInterval; -- forward decl: captureEnv uses it before its definition
 local envCaptured = {};
 
 local function captureEnv(factory)
@@ -732,9 +794,22 @@ local function captureEnv(factory)
     pcall(function()
         local origFactory = clonefunction(factory);
         hookfunction(factory, function(ctx, ...)
+            -- patch the LIVE config BEFORE the env is built: the env derives its
+            -- fire interval from 60 / RPM at construction time
+            if type(ctx) == "table" and type(ctx.GunConfig) == "table" then
+                -- assign back: the env captures this table, so a frozen original
+                -- must be swapped for the writable copy BEFORE it is built
+                local gc = applyWeaponModsTo(ctx.GunConfig);
+                ctx.GunConfig = gc;
+                if ctx.Tool then liveConfigs[ctx.Tool] = gc; end;
+            end;
             local t = origFactory(ctx, ...);
             if type(t) == "table" and type(ctx) == "table" and ctx.Tool then
                 envByTool[ctx.Tool] = t;
+                envRealExtra[ctx.Tool] = { CanFire = t.CanFire, ShootOnce = t.ShootOnce };
+                -- the interval is captured the moment the env is built, so shrink
+                -- it here too when rapid fire is already on
+                if getgenv().wh_rapidfire then applyEnvInterval(ctx.Tool); end;
             end;
             return t;
         end);
@@ -747,6 +822,9 @@ local function wrapFiremodeEnv(factory)
     return pcall(function()
         local origFactory = clonefunction(factory);
         hookfunction(factory, function(ctx, fireOnce, anims)
+            if type(ctx) == "table" and type(ctx.GunConfig) == "table" then
+                ctx.GunConfig = applyWeaponModsTo(ctx.GunConfig);
+            end;
             local t = origFactory(ctx, fireOnce, anims);
             if not (getgenv().wh_full_auto and type(t) == "table"
                     and type(fireOnce) == "function"
@@ -757,6 +835,7 @@ local function wrapFiremodeEnv(factory)
             local rpm = (ctx and ctx.GunConfig and ctx.GunConfig.RPM) or 600;
             local interval = 60 / math.max(rpm, 1);
             local origStart = t.FireInputStart;
+            if type(ctx) == "table" and ctx.Tool then envRealStart[ctx.Tool] = origStart; end;
             t.FireInputStart = function(...)
                 origStart(...);
                 task.spawn(function()
@@ -820,29 +899,143 @@ end
 
 table.insert(Connections, plr.CharacterAdded:Connect(watchForTools));
 watchForTools(plr.Character);
+
+-- Weapon toggles apply to the gun you are ALREADY holding: the fire mode envs
+-- keep a reference to the same config table and re-read RPM, so re-apply often.
+task.spawn(function()
+    while Running do
+        task.wait(0.5);
+        local char = plr.Character;
+        local tool = char and char:FindFirstChildOfClass("Tool");
+        local cfg = tool and liveConfigs[tool];
+        if cfg then
+            local patched = applyWeaponModsTo(cfg);
+            if patched ~= cfg and tool then liveConfigs[tool] = patched; end;
+        end;
+        -- rewrite the captured shot interval so enabling rapid fire (or changing
+        -- the multiplier) works on the gun already in your hands
+        if tool then applyEnvInterval(tool); end;
+    end;
+end);
 --================================================================
---  AUTO SHOOT
---  Instead of synthesising a mouse click (virtual input is not available on the
---  client anyway), this calls the equipped gun's own firemode env. Each env's
---  FireInputStart already rate-limits against 60 / RPM, so calling it once a
---  frame fires as fast as that gun allows - through the real shot path.
+--  AUTO SHOOT  -  fire input backends
+--  VirtualInputManager is a Studio/server service: on a real client
+--  game:GetService("VirtualInputManager") normally errors, and executors expose
+--  virtual mouse input only on some of them. The input method is therefore
+--  selectable:
+--    VIM      - VirtualInputManager:SendMouseButtonEvent (Studio, or servers that expose it)
+--    Executor - the executor's own virtual mouse (syn.virtual_input / PressMouseButton)
+--    Env      - drive the gun's own firemode env directly (always available, fakes no input)
+--    Auto     - try VIM, then Executor, otherwise fall back to Env
+--  VIM and the executor backends inject genuine input, so the game\'s normal input
+--  pipeline (ContextActionService, the fire mode) sees a real trigger pull.
 --================================================================
-local autoshootActive = false;
+local function mousePoint()
+    local m = UIS:GetMouseLocation();
+    return m.X, m.Y;
+end
+
+local function tryVim()
+    local ok, svc = pcall(function() return game:GetService("VirtualInputManager"); end);
+    if not ok or not svc or typeof(svc) ~= "Instance" then return nil; end;
+    local okSend, send = pcall(function() return svc.SendMouseButtonEvent; end);
+    if not okSend or type(send) ~= "function" then return nil; end;
+    return {
+        kind = "VIM",
+        down = function()
+            local x, y = mousePoint();
+            svc:SendMouseButtonEvent(x, y, 0, true, 0, 1);
+        end,
+        up = function()
+            local x, y = mousePoint();
+            svc:SendMouseButtonEvent(x, y, 0, false, 0, 1);
+        end;
+    };
+end
+
+local function tryExecutor()
+    if type(syn) == "table" and type(syn.virtual_input) == "function" then
+        return {
+            kind = "Executor",
+            down = function()
+                local x, y = mousePoint();
+                syn.virtual_input({ X = x, Y = y, type = "mousedown" });
+            end,
+            up = function()
+                local x, y = mousePoint();
+                syn.virtual_input({ X = x, Y = y, type = "mouseup" });
+            end;
+        };
+    end;
+    if type(PressMouseButton) == "function" and type(ReleaseMouseButton) == "function" then
+        return {
+            kind = "Executor",
+            down = function() PressMouseButton(1) end,
+            up = function() ReleaseMouseButton(1) end,
+        };
+    end;
+    return nil;
+end
+
+local fireBackend, fireBackendKind; -- resolved on first use, re-resolved if changed
+local function resolveBackend()
+    local want = getgenv().wh_fire_input or "Auto";
+    if fireBackendKind == want then return fireBackend; end;
+    fireBackend, fireBackendKind = nil, want;
+    if want == "VIM" then
+        fireBackend = tryVim();
+    elseif want == "Executor" then
+        fireBackend = tryExecutor();
+    elseif want == "Auto" then
+        fireBackend = tryVim() or tryExecutor();
+    end;
+    if not fireBackend then fireBackendKind = want .. " (env fallback)"; end;
+    return fireBackend;
+end
+
+local autoshootActive = false; -- env backend: a burst is in progress
+local triggerHeld = false;     -- input backends: button currently down
+local nextPulse = 0;
+
+local function isAutoFire(tool)
+    return tool and tool:GetAttribute("State_Firemode") == "Auto";
+end
 
 local function applyAutoshoot()
     local tool = getEquippedTool();
-    local env = tool and envByTool[tool];
-    if not env then return; end;
-    if not getgenv().wh_autoshoot then
-        if autoshootActive then
-            autoshootActive = false;
-            if type(env.FireInputEnd) == "function" then pcall(function() env.FireInputEnd(); end); end;
+    local enabled = getgenv().wh_autoshoot == true;
+    local wantFire = enabled and last.part ~= nil;
+
+    local backend = resolveBackend();
+    if backend then
+        if wantFire then
+            -- an automatic gun only needs the trigger held; semi/pump guns need
+            -- repeated press/release pulses to fire over and over
+            if isAutoFire(tool) then
+                if not triggerHeld then
+                    triggerHeld = true;
+                    pcall(backend.down);
+                end;
+            else
+                local now = os.clock();
+                if now >= nextPulse then
+                    nextPulse = now + (getgenv().wh_autoshoot_pulse or 0.08);
+                    pcall(backend.down);
+                    task.delay(0.03, function() pcall(backend.up); end);
+                end;
+            end;
+        elseif triggerHeld then
+            triggerHeld = false;
+            pcall(backend.up);
         end;
         return;
     end;
-    if type(env.FireInputStart) ~= "function" then return; end;
-    -- nothing locked: release the trigger so a burst does not keep running
-    if not last.part then
+
+    -- Env fallback: the gun\'s own firemode entry point. FireInputStart already
+    -- rate-limits against 60 / RPM, so this fires as fast as the gun allows.
+    local env = tool and envByTool[tool];
+    if not env or type(env.FireInputStart) ~= "function" then return; end;
+    if not (enabled and last.part) then
         if autoshootActive and type(env.FireInputEnd) == "function" then
             autoshootActive = false;
             pcall(function() env.FireInputEnd(); end);
@@ -852,6 +1045,219 @@ local function applyAutoshoot()
     autoshootActive = true;
     pcall(function() env.FireInputStart(); end);
 end
+
+--================================================================
+--  BULLET TRAILS
+--  The projectile envs call env.Fire(shotId, origin, dir) ONCE PER PELLET, with
+--  the direction already rotated by that pellet's spread offset and the origin at
+--  the muzzle. Wrapping env.Fire (read-only - the original still runs untouched)
+--  therefore hands us the exact flight path of every bullet, which we integrate
+--  with the gun's own ProjectileVelocity / ProjectileGravity so the trail drops
+--  exactly like the real round. Hitscan guns (velocity 0) get a straight line
+--  ending at their real raycast hit.
+--================================================================
+local TRACER_SEGS = 16;
+local trailPool = {};
+local tracerWrapped = {};
+
+local function acquireTrail()
+    local now = os.clock();
+    for _, t in next, trailPool do
+        if t.expires <= now then return t; end;
+    end;
+    local t = { segs = {}, expires = 0 };
+    for i = 1, TRACER_SEGS do
+        t.segs[i] = createObj("Line", {
+            Thickness = 2, Visible = false, ZIndex = 1,
+            Color = getgenv().wh_tracer_seg_color,
+        });
+    end;
+    table.insert(trailPool, t);
+    return t;
+end
+
+local function updateTrails()
+    local now = os.clock();
+    for _, t in next, trailPool do
+        if t.expires <= now then
+            for i = 1, TRACER_SEGS do
+                local s = t.segs[i];
+                if s then s.Visible = false; end;
+            end;
+        end;
+    end;
+end
+
+local function drawBulletTrail(cfg, origin, dir)
+    if not hasDrawing or not getgenv().wh_tracer_bullets then return; end;
+    if not (origin and dir) then return; end;
+    if not (isFinite(origin.X) and isFinite(origin.Y) and isFinite(origin.Z)) then return; end;
+    if not (isFinite(dir.X) and isFinite(dir.Y) and isFinite(dir.Z)) then return; end;
+    local mag = dir.Magnitude;
+    if mag < 0.0001 then return; end;
+    local unit = dir / mag;
+    local speed = (type(cfg) == "table" and cfg.ProjectileVelocity) or 0;
+    local grav  = (type(cfg) == "table" and cfg.ProjectileGravity) or 0;
+    local range = (type(cfg) == "table" and cfg.ProjectileMaxRange) or 2000;
+
+    local pts = {};
+    if type(speed) == "number" and speed > 0 then
+        local g = Vector3.new(0, -math.abs(grav), 0);
+        local step = 0.015;
+        local travelled = 0;
+        for i = 1, TRACER_SEGS do
+            local t = step * i;
+            local p = origin + unit * (speed * t) + g * (0.5 * t * t);
+            pts[i] = p;
+            travelled = travelled + (p - (pts[i-1] or origin)).Magnitude;
+            if travelled > range then
+                for k = i + 1, TRACER_SEGS do pts[k] = nil; end;
+                break;
+            end;
+        end;
+    else
+        local okc, hit = pcall(Workspace.Raycast, Workspace, origin, unit * range, aimFilter);
+        local dist;
+        if okc and hit then
+            dist = (hit.Position - origin).Magnitude;
+        else
+            dist = math.min(range, 3000);
+        end;
+        pts[1] = origin + unit * dist;
+    end;
+
+    local t = acquireTrail();
+    t.expires = os.clock() + (getgenv().wh_tracer_life or 0.35);
+    local col = getgenv().wh_tracer_seg_color or Color3.new(1, 1, 1);
+    -- hide the whole trail first, then light up only the segments we fill
+    for i = 1, TRACER_SEGS do
+        local s = t.segs[i];
+        if s then s.Visible = false; end;
+    end;
+    local prevScreen;
+    for i = 1, TRACER_SEGS do
+        local p = pts[i];
+        if p then
+            local sp = toScreen(cam:WorldToViewportPoint(p));
+            local seg = t.segs[i];
+            if seg and isFiniteVec2(sp) and prevScreen then
+                seg.From = prevScreen;
+                seg.To = sp;
+                seg.Color = col;
+                seg.Visible = true;
+                prevScreen = sp;
+            else
+                prevScreen = nil; -- off-screen breaks the chain
+            end;
+        end;
+    end;
+end
+
+local function wrapTracerFactory(factory)
+    if tracerWrapped[factory] then return; end;
+    tracerWrapped[factory] = true;
+    pcall(function()
+        local orig = clonefunction(factory);
+        hookfunction(factory, function(ctx, ...)
+            local env = orig(ctx, ...);
+            if type(env) == "table" and type(env.Fire) == "function"
+                and not tracerWrapped[env.Fire] then
+                tracerWrapped[env.Fire] = true;
+                local cfg = (type(ctx) == "table" and ctx.GunConfig) or nil;
+                local tool = type(ctx) == "table" and ctx.Tool or nil;
+                local realFire = clonefunction(env.Fire);
+                hookfunction(env.Fire, function(shotId, origin, dir, extra)
+                    -- observe only: the game's own Fire still runs, unchanged
+                    pcall(drawBulletTrail, cfg or (tool and liveConfigs[tool]), origin, dir);
+                    return realFire(shotId, origin, dir, extra);
+                end);
+            end;
+            return env;
+        end);
+    end);
+end
+
+-- RAPID FIRE, second pass.
+-- The "Auto" fire mode captures its shot interval as an UPVALUE when the env is
+-- built:   local interval = 60 / GunConfig.RPM
+-- Boosting RPM afterwards therefore does nothing for that gate, which is exactly
+-- why the toggle looked dead. So rewrite the captured value itself - that number
+-- IS the delay between shots. ("Semi" re-reads RPM live, so it already worked.)
+local MIN_SHOT_DELAY = 0.017; -- the game hard-blocks re-entry at ~0.015s
+
+local function shotDelays(tool)
+    local cfg = tool and liveConfigs[tool];
+    local rpm = (type(cfg) == "table" and baseRPM[cfg]) or nil;
+    if type(rpm) ~= "number" then rpm = (type(cfg) == "table" and cfg.RPM) or 600; end;
+    local base = 60 / math.max(rpm, 1);
+    local mult = getgenv().wh_rapidfire and math.max(getgenv().wh_rpm_mult or 1, 1) or 1;
+    return base, math.max(base / mult, MIN_SHOT_DELAY);
+end
+
+-- rewrite any captured upvalue that sits on the gun's own shot interval
+function applyEnvInterval(tool)
+    local env = tool and envByTool[tool];
+    if type(env) ~= "table" then return false; end;
+    local base, want = shotDelays(tool);
+    local targets = {};
+    local s = envRealStart[tool];
+    if type(s) == "function" then targets[#targets + 1] = s; end;
+    local extra = envRealExtra[tool];
+    if type(extra) == "table" then
+        if type(extra.CanFire) == "function" then targets[#targets + 1] = extra.CanFire; end;
+        if type(extra.ShootOnce) == "function" then targets[#targets + 1] = extra.ShootOnce; end;
+    end;
+    if type(env.CanFire) == "function" then targets[#targets + 1] = env.CanFire; end;
+    local changed = false;
+    for _, fn in ipairs(targets) do
+        pcall(function()
+            for i = 1, 64 do
+                local up, val = debug.getupvalue(fn, i);
+                if up == nil then break; end;
+                if type(val) == "number" and val > 0 and math.abs(val - base) <= base * 0.35 then
+                    debug.setupvalue(fn, i, want);
+                    changed = true;
+                end;
+            end;
+        end);
+    end;
+    return changed;
+end
+
+local function installTracerForTool(tool)
+    if not tool then return 0; end;
+    local folder = tool:FindFirstChild("ProjectileEnvConstructors", true);
+    if not folder then return 0; end;
+    local n = 0;
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("ModuleScript") then
+            local ok, factory = pcall(require, c);
+            if ok and type(factory) == "function" then
+                wrapTracerFactory(factory);
+                n = n + 1;
+            end;
+        end;
+    end;
+    return n;
+end
+
+local function watchTracerEnvs(char)
+    if not char then return; end;
+    local function scan(t) task.defer(function() installTracerForTool(t); end); end;
+    local bp = plr:FindFirstChildOfClass("Backpack");
+    if bp then bp.ChildAdded:Connect(scan); end;
+    char.ChildAdded:Connect(scan);
+    task.spawn(function()
+        for _ = 1, 8 do
+            if not Running then return; end;
+            installTracerForTool(getEquippedTool());
+            if bp then for _, t in ipairs(bp:GetChildren()) do installTracerForTool(t); end; end;
+            task.wait(1);
+        end;
+    end);
+end
+table.insert(Connections, plr.CharacterAdded:Connect(watchTracerEnvs));
+watchTracerEnvs(plr.Character);
 
 --================================================================
 --  CAMERA / MOVEMENT / FAKE ROTATION / HORSES
@@ -869,18 +1275,87 @@ local function applyFov()
     end;
 end
 
--- SPEED BOOST (CFrame): WalkSpeed is left alone; while a movement key is held the
--- RootPart is translated an extra (speed * dt) along the current move direction.
+-- SPEED BOOST: two methods, and WalkSpeed is never touched in either.
+--   CFrame - a smooth extra (speed * dt) studs each frame along the move direction
+--   TPWalk - discrete hops of `tp_distance` studs every `tp_interval` seconds,
+--            which reads as teleport-walking rather than a smooth glide
+local tpAccum = 0;
+local tpPending = 0; -- unspent TPWalk distance being eased out
 local function applySpeedBoost(dt)
-    if not getgenv().wh_speed_on then return; end;
+    if not getgenv().wh_speed_on then
+        tpAccum = 0;
+        tpPending = 0;
+        return;
+    end;
     local char = plr.Character;
     local hum = char and char:FindFirstChildOfClass("Humanoid");
     local hrp = char and char:FindFirstChild("HumanoidRootPart");
     if not (hum and hrp) then return; end;
-    local dir = hum.MoveDirection;
-    if dir.Magnitude < 0.05 then return; end; -- only while actually moving
-    local extra = (getgenv().wh_speed or 45) * (dt or 0);
-    pcall(function() hrp.CFrame = hrp.CFrame + dir * extra; end);
+    local dir = hum.MoveDirection; -- already world space / camera relative
+    if dir.Magnitude < 0.05 then
+        tpAccum = 0;
+        tpPending = 0;
+        return;
+    end;
+    if (getgenv().wh_speed_method or "CFrame") == "TPWalk" then
+        tpAccum = tpAccum + (dt or 0);
+        local iv = math.max(getgenv().wh_tp_interval or 0.1, 0.005);
+        local dist = getgenv().wh_tp_distance or 2;
+        -- while-loop so a frame hitch cannot silently swallow accumulated hops
+        local guard = 0;
+        while tpAccum >= iv and guard < 64 do
+            tpAccum = tpAccum - iv;
+            guard = guard + 1;
+            if getgenv().wh_tp_smooth then
+                -- bank the hop and pay it out over the interval, so the motion is
+                -- continuous instead of a series of teleports
+                tpPending = tpPending + dist;
+            else
+                pcall(function() hrp.CFrame = hrp.CFrame + dir.Unit * dist; end);
+            end;
+        end;
+        if getgenv().wh_tp_smooth and tpPending > 0 then
+            -- this frame's slice of the pending distance
+            local slice = tpPending * ((dt or 0) / iv);
+            if slice > tpPending then slice = tpPending; end;
+            tpPending = tpPending - slice;
+            pcall(function() hrp.CFrame = hrp.CFrame + dir.Unit * slice; end);
+        end;
+    else
+        local step = (getgenv().wh_speed or 45) * (dt or 0);
+        pcall(function() hrp.CFrame = hrp.CFrame + dir.Unit * step; end);
+    end;
+end
+
+-- JUMP HACK: on take-off, replace the upward velocity with our own. Roblox jumps
+-- are velocity driven, so this is what actually raises the jump; the small CFrame
+-- nudge guarantees clearance even on a frame where the floor check lags.
+local jumpArmed = true;
+local function applyJumpBoost()
+    if not getgenv().wh_jump or getgenv().wh_fly then
+        jumpArmed = true;
+        return;
+    end;
+    local char = plr.Character;
+    local hum = char and char:FindFirstChildOfClass("Humanoid");
+    local hrp = char and char:FindFirstChild("HumanoidRootPart");
+    if not (hum and hrp) then return; end;
+    local state = hum:GetState();
+    local grounded = state == Enum.HumanoidStateType.Landed
+        or state == Enum.HumanoidStateType.Running
+        or hum.FloorMaterial ~= Enum.Material.Air;
+    local wants = UIS:IsKeyDown(Enum.KeyCode.Space);
+    if wants and grounded and jumpArmed then
+        jumpArmed = false;
+        local p = getgenv().wh_jump_power or 95;
+        local v = hrp.AssemblyLinearVelocity;
+        pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.new(v.X, p, v.Z);
+            hrp.CFrame = hrp.CFrame + Vector3.new(0, 0.6, 0);
+        end);
+    elseif grounded and not wants then
+        jumpArmed = true; -- re-arm on landing so the next press fires again
+    end;
 end
 
 -- FLY (CFrame): WASD plus Space / LeftControl move the RootPart directly.
@@ -911,6 +1386,8 @@ end
 local fakeSpinAngle = 0;
 local fakeNextRandom = 0;
 local fakeRand = { p = 0, y = 0, r = 0 };
+local fakeJitterYaw = 0;
+local fakeNextJitter = 0;
 
 local function fakeAngles(dt)
     local mode = getgenv().wh_fake_mode or "Custom";
@@ -928,6 +1405,16 @@ local function fakeAngles(dt)
             fakeRand.r = math.random(-180, 180);
         end;
         return fakeRand.p, fakeRand.y, fakeRand.r;
+    end;
+    if mode == "Jitter" then
+        -- pitch/roll come from the sliders, but yaw is re-rolled every interval so
+        -- the body keeps snapping to a new facing
+        local now = os.clock();
+        if now >= fakeNextJitter then
+            fakeNextJitter = now + math.max(getgenv().wh_jitter_interval or 0.15, 0.02);
+            fakeJitterYaw = math.random(-180, 180);
+        end;
+        return getgenv().wh_fake_pitch or 0, fakeJitterYaw, getgenv().wh_fake_roll or 0;
     end;
     return getgenv().wh_fake_pitch or 0, getgenv().wh_fake_yaw or 0, getgenv().wh_fake_roll or 0;
 end
@@ -1138,21 +1625,41 @@ local function newEsp()
         OutlineColor = Color3.new(0, 0, 0), Visible = false, ZIndex = 3 });
     o.hpBg = createObj("Line", { Thickness = 3, Visible = false, ZIndex = 2 });
     o.hp   = createObj("Line", { Thickness = 3, Visible = false, ZIndex = 3 });
+    o.item = createObj("Text", { Size = 12, Center = true, Outline = true,
+        OutlineColor = Color3.new(0, 0, 0), Visible = false, ZIndex = 3 });
     return o;
 end
 
 local function freeEsp(o)
     for _, l in ipairs(o.lines) do if l then pcall(function() l:Remove(); end); end; end;
-    for _, k in ipairs({ "name", "dist", "hpBg", "hp" }) do
+    for _, k in ipairs({ "name", "dist", "item", "hpBg", "hp" }) do
         if o[k] then pcall(function() o[k]:Remove(); end); end;
     end;
 end
 
 local function hideEsp(o)
     for _, l in ipairs(o.lines) do if l then l.Visible = false; end; end;
-    for _, k in ipairs({ "name", "dist", "hpBg", "hp" }) do
+    for _, k in ipairs({ "name", "dist", "item", "hpBg", "hp" }) do
         if o[k] then o[k].Visible = false; end;
     end;
+end
+
+-- the item a player is visibly carrying: their equipped Tool (named by its
+-- ItemConfig attribute when the game sets one), falling back to any child that
+-- advertises ItemConfig
+local function equippedItemName(model)
+    for _, c in ipairs(model:GetChildren()) do
+        if c:IsA("Tool") then
+            local cfg = c:GetAttribute("ItemConfig");
+            if type(cfg) == "string" and cfg ~= "" then return cfg; end;
+            return c.Name;
+        end;
+    end;
+    for _, c in ipairs(model:GetChildren()) do
+        local cfg = c:GetAttribute("ItemConfig");
+        if type(cfg) == "string" and cfg ~= "" then return cfg; end;
+    end;
+    return nil;
 end
 
 local function drawEsp(model)
@@ -1239,6 +1746,41 @@ local function drawEsp(model)
         else
             o.hpBg.Visible = false;
             o.hp.Visible = false;
+        end;
+    end
+
+    -- item finder: label the player with what they are holding
+    if o.item then
+        o.item.Visible = false;
+        if getgenv().wh_item_finder then
+            local sel = getgenv().wh_item_search;
+            if type(sel) == "string" then sel = { [sel] = true }; end;
+            if type(sel) ~= "table" then sel = { Any = true }; end;
+            local held = equippedItemName(model);
+            if held then
+                local hl = string.lower(held);
+                local show = false;
+                -- Linoria Multi gives { ["ItemName"] = true }, but tolerate an
+                -- array or a plain string too rather than silently matching none
+                for k, v in next, sel do
+                    local name = type(k) == "string" and k
+                        or (type(v) == "string" and v or nil);
+                    if name == "Any" then
+                        show = true;
+                        break;
+                    end;
+                    if name and name ~= "" and string.find(hl, string.lower(name), 1, true) then
+                        show = true;
+                        break;
+                    end;
+                end;
+                if show then
+                    o.item.Text = held;
+                    o.item.Position = Vector2.new(cx, hy + 16);
+                    o.item.Color = getgenv().wh_item_color;
+                    o.item.Visible = true;
+                end;
+            end;
         end;
     end
 end
@@ -1567,6 +2109,28 @@ SA:AddToggle("VSH_AutoShoot", {
     Callback = function(v) getgenv().wh_autoshoot = v; end;
 });
 
+SA:AddDropdown("VSH_FireInput", {
+    Text = "Auto Shoot Input",
+    Values = { "VIM", "Executor", "Env" },
+    Default = getgenv().wh_fire_input,
+    AllowNull = false,
+    Tooltip = "Auto = VirtualInputManager, then the executor's virtual mouse, then the gun's own fire mode",
+    Callback = function(v) getgenv().wh_fire_input = v; end;
+});
+
+SA:AddSlider("VSH_AutoPulse", {
+    Text = "Semi Click Rate",
+    Default = getgenv().wh_autoshoot_pulse,
+    Min = 0.03,
+    Max = 0.5,
+    Rounding = 2,
+    Suffix = " s",
+    Tooltip = "How often a semi/pump trigger is pressed and released",
+    Callback = function(v) getgenv().wh_autoshoot_pulse = v; end;
+});
+
+local fireInputLabel = SA:AddLabel("fire input: unresolved");
+
 SA:AddToggle("VSH_TargetNpcs", {
     Text = "Target NPCs",
     Default = getgenv().wh_target_npcs,
@@ -1745,6 +2309,65 @@ ESPG:AddToggle("VSH_EspNpcs", {
     Callback = function(v) getgenv().wh_esp_npcs = v; end,
 });
 
+ESPG:AddToggle("VSH_ItemFinder", {
+    Text = "Item Finder",
+    Default = getgenv().wh_item_finder,
+    Tooltip = "Labels each player with the item they are holding",
+    Callback = function(v) getgenv().wh_item_finder = v; end;
+});
+
+-- the dropdown is populated from the game's OWN weapon config map, so the list
+-- always matches whatever items this place actually has
+pcall(function() installWeaponHooks(); end);
+local itemNames = {};
+if type(itemConfigs) == "table" then
+    for k in next, itemConfigs do
+        if type(k) == "string" then itemNames[#itemNames + 1] = k; end;
+    end;
+end;
+table.sort(itemNames);
+local itemValues = { "Any" };
+for _, n in ipairs(itemNames) do itemValues[#itemValues + 1] = n; end;
+
+ESPG:AddDropdown("VSH_ItemSearch", {
+    Text = "Search Items",
+    Values = itemValues,
+    Default = "Any",
+    Multi = true, -- several items can be selected at once
+    AllowNull = false,
+    Tooltip = "Any = show every player's item, otherwise only a matching item is labelled",
+    Callback = function(v) getgenv().wh_item_search = v; end;
+});
+
+addColorPicker(ESPG, "VSH_ItemColor", {
+    Title = "Item Color",
+    Default = getgenv().wh_item_color,
+    Callback = function(c) getgenv().wh_item_color = c; end;
+});
+
+ESPG:AddToggle("VSH_BulletTrails", {
+    Text = "Bullet Trails",
+    Default = getgenv().wh_tracer_bullets,
+    Tooltip = "Draws the real flight path of every pellet, including drop and spread",
+    Callback = function(v) getgenv().wh_tracer_bullets = v; end;
+});
+
+ESPG:AddSlider("VSH_TrailLife", {
+    Text = "Trail Lifetime",
+    Default = getgenv().wh_tracer_life,
+    Min = 0.05,
+    Max = 1.5,
+    Rounding = 2,
+    Suffix = " s",
+    Callback = function(v) getgenv().wh_tracer_life = v; end;
+});
+
+addColorPicker(ESPG, "VSH_TrailColor", {
+    Title = "Trail Color",
+    Default = getgenv().wh_tracer_seg_color,
+    Callback = function(c) getgenv().wh_tracer_seg_color = c; end;
+});
+
 ESPG:AddToggle("VSH_EspHorses", {
     Text = "Horses",
     Default = getgenv().wh_esp_horses,
@@ -1803,7 +2426,64 @@ MOVE:AddSlider("VSH_SpeedAmount", {
     Callback = function(v) getgenv().wh_speed = v; end,
 });
 
+MOVE:AddDropdown("VSH_SpeedMethod", {
+    Text = "Method",
+    Values = { "CFrame", "TPWalk" },
+    Default = getgenv().wh_speed_method,
+    AllowNull = false,
+    Tooltip = "CFrame = smooth glide | TPWalk = discrete hops of tp_distance studs",
+    Callback = function(v) getgenv().wh_speed_method = v; end;
+});
+
+MOVE:AddSlider("VSH_TpInterval", {
+    Text = "TPWalk Interval",
+    Default = getgenv().wh_tp_interval,
+    Min = 0.01,
+    Max = 0.5,
+    Rounding = 2,
+    Suffix = " s",
+    Callback = function(v) getgenv().wh_tp_interval = v; end;
+});
+
+MOVE:AddSlider("VSH_TpDistance", {
+    Text = "TPWalk Distance",
+    Default = getgenv().wh_tp_distance,
+    Min = 0.1,
+    Max = 2,
+    Rounding = 2,
+    Suffix = " st",
+    Callback = function(v) getgenv().wh_tp_distance = v; end;
+});
+
+MOVE:AddToggle("VSH_TpSmooth", {
+    Text = "TPWalk Smooth",
+    Default = getgenv().wh_tp_smooth,
+    Tooltip = "Spreads each hop over the interval for continuous motion (off = hard teleports)",
+    Callback = function(v) getgenv().wh_tp_smooth = v; end;
+});
+
 MOVE:AddLabel("Extra distance per second while you hold a movement key.");
+
+local JUMP = Tabs.Move:AddLeftGroupbox("Jump Hack");
+
+JUMP:AddToggle("VSH_Jump", {
+    Text = "Super Jump",
+    Default = getgenv().wh_jump,
+    Tooltip = "Replaces the take-off velocity with your own (ignored while flying)",
+    Callback = function(v) getgenv().wh_jump = v; end;
+});
+
+JUMP:AddSlider("VSH_JumpPower", {
+    Text = "Jump Power",
+    Default = getgenv().wh_jump_power,
+    Min = 40,
+    Max = 250,
+    Rounding = 0,
+    Suffix = " st/s",
+    Callback = function(v) getgenv().wh_jump_power = v; end;
+});
+
+JUMP:AddLabel("~196 st/s is normal gravity fall speed.");
 local FLY = Tabs.Move:AddLeftGroupbox("Fly");
 
 local flyToggle = FLY:AddToggle("VSH_Fly", {
@@ -1908,10 +2588,10 @@ FAKE:AddSlider("VSH_FakePitch", {
 
 FAKE:AddDropdown("VSH_FakeMode", {
     Text = "Rotation Mode",
-    Values = { "Custom", "Spin", "Random" },
+    Values = { "Custom", "Spin", "Random", "Jitter" },
     Default = getgenv().wh_fake_mode,
     AllowNull = false,
-    Tooltip = "Custom = your sliders | Spin = continuous yaw | Random = re-rolls all angles",
+    Tooltip = "Custom = sliders | Spin = continuous yaw | Random = re-rolls all | Jitter = random yaw every interval",
     Callback = function(v) getgenv().wh_fake_mode = v; end,
 });
 
@@ -1933,6 +2613,17 @@ FAKE:AddSlider("VSH_RandInt", {
     Rounding = 2,
     Suffix = " s",
     Callback = function(v) getgenv().wh_fake_rand_int = v; end,
+});
+
+FAKE:AddSlider("VSH_JitterInt", {
+    Text = "Jitter Every",
+    Default = getgenv().wh_jitter_interval,
+    Min = 0.02,
+    Max = 2,
+    Rounding = 2,
+    Suffix = " s",
+    Tooltip = "How often the yaw is re-rolled in Jitter mode",
+    Callback = function(v) getgenv().wh_jitter_interval = v; end;
 });
 
 FAKE:AddToggle("VSH_FakeTargetBased", {
@@ -2076,8 +2767,10 @@ table.insert(Connections, RunService.RenderStepped:Connect(function(dt)
         updateHud(part);
         applyAutoshoot();
         updateEsp();
+        updateTrails();
         applyFov();
         applySpeedBoost(dt);
+        applyJumpBoost();
         applyFly(dt);
         applyLighting();
         applyNoFallDamage();
@@ -2112,12 +2805,15 @@ task.spawn(function()
             -- show the gun's LIVE built stats: this is how you confirm the weapon
             -- mods actually applied (spread 0, and speed 0 = hitscan/instant)
             local lc = wt and liveConfigs[wt];
-            gunStatusLabel:SetText(string.format("%s | fm %s | spd %s | sprd %s | rpm %s",
+            local _, wantGap = shotDelays(wt);
+            gunStatusLabel:SetText(string.format("%s | fm %s | spd %s | sprd %s | rpm %s | gap %.0fms",
                 wt and wt.Name or "none",
                 tostring(wt and wt:GetAttribute("State_Firemode")),
                 lc and tostring(lc.ProjectileVelocity) or "-",
                 lc and tostring(lc.ProjectileSpread) or "-",
-                lc and tostring(lc.RPM) or "-"));
+                lc and tostring(lc.RPM) or "-",
+                wantGap * 1000));
+            fireInputLabel:SetText("fire input: " .. tostring(fireBackendKind or "unresolved"));
             clockLabel:SetText(string.format("clock %.2f | amb %s | fog %s",
                 Lighting.ClockTime, tostring(Lighting.Ambient),
                 getgenv().wh_nofog and "off" or "on"));
